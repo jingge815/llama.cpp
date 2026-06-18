@@ -243,6 +243,12 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_DOWNMEM)
+    llama_build(test-downmem-backend.cpp)
+    llama_test(test-downmem-backend LABEL "backend")
+    set_tests_properties(test-downmem-backend PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

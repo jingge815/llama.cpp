@@ -194,6 +194,11 @@ option(GGML_ACCELERATE                      "ggml: enable Accelerate framework" 
 option(GGML_BLAS                            "ggml: use BLAS"                                  ${GGML_BLAS_DEFAULT})
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                             "ggml: BLAS library vendor")
+option(GGML_DOWNMEM                         "ggml: use downmem simulator backend"             OFF)
+set(GGML_DOWNMEM_ROOT "/home/fjg/src/downmem" CACHE PATH
+                                            "ggml: downmem source root")
+set(GGML_DOWNMEM_LIB "${GGML_DOWNMEM_ROOT}/build-rv/libdmmShared.so" CACHE FILEPATH
+                                            "ggml: downmem dmm library")
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
