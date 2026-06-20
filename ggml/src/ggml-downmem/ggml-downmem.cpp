@@ -23,6 +23,7 @@ struct llama_gemv_f32_args_t {
     uint32_t k_pad;
     uint32_t n_rows;
     uint32_t max_rows;
+    uint32_t m;
     uint32_t a_offset;
     uint32_t x_offset;
     uint32_t y_offset;
@@ -40,6 +41,10 @@ struct ggml_backend_downmem_context {
     std::string binary_path;
     dpu_set_t set = {};
     int executed_ops = 0;
+};
+
+struct ggml_backend_downmem_device_context {
+    int claimed_ops = 0;
 };
 
 static bool ggml_downmem_env_enabled(void) {
@@ -104,11 +109,13 @@ static bool ggml_downmem_file_exists(const char * path) {
     return true;
 }
 
-static bool ggml_downmem_src1_is_plain_f32_vector(const ggml_tensor * t) {
+static bool ggml_downmem_src1_is_plain_f32_matrix(const ggml_tensor * t) {
     return t != nullptr &&
            t->type == GGML_TYPE_F32 &&
            t->nb[0] == (int64_t) sizeof(float) &&
-           t->nb[1] >= t->nb[0] * t->ne[0];
+           t->nb[1] >= t->nb[0] * t->ne[0] &&
+           t->ne[2] == 1 &&
+           t->ne[3] == 1;
 }
 
 static bool ggml_downmem_src0_can_stage_to_f32(const ggml_tensor * t) {
@@ -129,7 +136,7 @@ static bool ggml_downmem_src0_can_stage_to_f32(const ggml_tensor * t) {
     return traits != nullptr && traits->to_float != nullptr;
 }
 
-static bool ggml_downmem_supports_mul_mat_gemv(const ggml_tensor * op, bool require_runtime_ready) {
+static bool ggml_downmem_supports_mul_mat_f32(const ggml_tensor * op, bool require_runtime_ready) {
     if (!ggml_downmem_env_enabled()) {
         return false;
     }
@@ -142,21 +149,25 @@ static bool ggml_downmem_supports_mul_mat_gemv(const ggml_tensor * op, bool requ
 
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (!ggml_downmem_src0_can_stage_to_f32(src0) || !ggml_downmem_src1_is_plain_f32_vector(src1)) {
+    if (!ggml_downmem_src0_can_stage_to_f32(src0) || !ggml_downmem_src1_is_plain_f32_matrix(src1)) {
         return false;
     }
     if (src0->ne[0] != src1->ne[0]) {
         return false;
     }
-    if (src1->ne[1] != 1 || op->ne[0] != src0->ne[1] || op->ne[1] != 1) {
+    if (op->ne[0] != src0->ne[1] || op->ne[1] != src1->ne[1]) {
         return false;
     }
     if (op->nb[0] != (int64_t) sizeof(float) || op->nb[1] < op->nb[0] * op->ne[0]) {
         return false;
     }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
-        src1->ne[2] != 1 || src1->ne[3] != 1 ||
         op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+
+    const int max_cols = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_COLS", 128);
+    if (max_cols > 0 && src1->ne[1] > max_cols) {
         return false;
     }
 
@@ -238,53 +249,57 @@ static bool ggml_downmem_stage_src0_row_major(const ggml_tensor * src0, float * 
     return true;
 }
 
-static void ggml_downmem_stage_src1_vector(const ggml_tensor * src1, float * x, uint32_t k) {
-    if (src1->nb[0] == (int64_t) sizeof(float)) {
-        std::memcpy(x, src1->data, k * sizeof(float));
-        return;
-    }
+static void ggml_downmem_stage_src1_matrix(const ggml_tensor * src1, float * x, uint32_t k, uint32_t m, uint32_t k_pad) {
+    for (uint32_t out_col = 0; out_col < m; ++out_col) {
+        const char * src_col = (const char *) src1->data + out_col * src1->nb[1];
+        float * dst_col = x + (size_t) out_col * k_pad;
+        if (src1->nb[0] == (int64_t) sizeof(float)) {
+            std::memcpy(dst_col, src_col, k * sizeof(float));
+            continue;
+        }
 
-    for (uint32_t col = 0; col < k; ++col) {
-        const char * src = (const char *) src1->data + col * src1->nb[0];
-        std::memcpy(x + col, src, sizeof(float));
+        for (uint32_t col = 0; col < k; ++col) {
+            const char * src = src_col + col * src1->nb[0];
+            std::memcpy(dst_col + col, src, sizeof(float));
+        }
     }
 }
 
-static bool ggml_downmem_validate_result(const ggml_tensor * src1, const float * a_rows, const float * y,
-                                         uint32_t k, uint32_t n, uint32_t k_pad) {
+static bool ggml_downmem_validate_result(const float * x, const float * a_rows, const float * y,
+                                         uint32_t k, uint32_t n, uint32_t m, uint32_t k_pad) {
     const char * enabled = std::getenv("GGML_DOWNMEM_VALIDATE");
     if (enabled == nullptr || std::strcmp(enabled, "0") == 0) {
         return true;
     }
 
-    std::vector<float> x(k, 0.0f);
-    ggml_downmem_stage_src1_vector(src1, x.data(), k);
+    for (uint32_t out_col = 0; out_col < m; ++out_col) {
+        const float * x_col = x + (size_t) out_col * k_pad;
+        for (uint32_t row = 0; row < n; ++row) {
+            float expected = 0.0f;
+            const float * a_row = a_rows + (size_t) row * k_pad;
+            for (uint32_t col = 0; col < k; ++col) {
+                expected += a_row[col] * x_col[col];
+            }
 
-    for (uint32_t row = 0; row < n; ++row) {
-        float expected = 0.0f;
-        const float * a_row = a_rows + (size_t) row * k_pad;
-        for (uint32_t col = 0; col < k; ++col) {
-            expected += a_row[col] * x[col];
-        }
-
-        const float got = y[row];
-        const float diff = std::fabs(got - expected);
-        const float scale = std::max(1.0f, std::fabs(expected));
-        if (!(diff <= 1.0e-4f || diff <= scale * 1.0e-4f)) {
-            GGML_LOG_ERROR("%s: validation failed row=%u expected=%g got=%g diff=%g\n",
-                           __func__, row, (double) expected, (double) got, (double) diff);
-            return false;
+            const float got = y[(size_t) out_col * n + row];
+            const float diff = std::fabs(got - expected);
+            const float scale = std::max(1.0f, std::fabs(expected));
+            if (!(diff <= 1.0e-4f || diff <= scale * 1.0e-4f)) {
+                GGML_LOG_ERROR("%s: validation failed row=%u out_col=%u expected=%g got=%g diff=%g\n",
+                               __func__, row, out_col, (double) expected, (double) got, (double) diff);
+                return false;
+            }
         }
     }
 
     return true;
 }
 
-static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_tensor * dst) {
+static bool ggml_downmem_mul_mat_f32(ggml_backend_downmem_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (!ggml_downmem_supports_mul_mat_gemv(dst, true)) {
+    if (!ggml_downmem_supports_mul_mat_f32(dst, true)) {
         GGML_LOG_ERROR("%s: scheduled unsupported op\n", __func__);
         return false;
     }
@@ -294,6 +309,7 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
 
     const uint32_t k = (uint32_t) src0->ne[0];
     const uint32_t n = (uint32_t) src0->ne[1];
+    const uint32_t m = (uint32_t) src1->ne[1];
     const uint32_t k_pad = ggml_downmem_align_up_u32(k, 2);
 
     std::vector<dpu_rows_t> layout(ctx->nr_dpus);
@@ -308,8 +324,8 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
     max_rows = std::max(max_rows, 1u);
 
     const uint32_t a_floats_per_dpu = max_rows * k_pad;
-    const uint32_t x_floats_per_dpu = k_pad;
-    const uint32_t y_floats_per_dpu = max_rows;
+    const uint32_t x_floats_per_dpu = k_pad * m;
+    const uint32_t y_floats_per_dpu = max_rows * m;
     const uint32_t a_bytes = a_floats_per_dpu * sizeof(float);
     const uint32_t x_bytes = x_floats_per_dpu * sizeof(float);
     const uint32_t y_bytes = y_floats_per_dpu * sizeof(float);
@@ -327,12 +343,12 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
     }
 
     std::vector<float> a_padded((size_t) ctx->nr_dpus * a_floats_per_dpu, 0.0f);
-    std::vector<float> x(k_pad, 0.0f);
-    std::vector<float> y_padded((size_t) ctx->nr_dpus * max_rows, 0.0f);
-    std::vector<float> y(n, 0.0f);
+    std::vector<float> x(x_floats_per_dpu, 0.0f);
+    std::vector<float> y_padded((size_t) ctx->nr_dpus * y_floats_per_dpu, 0.0f);
+    std::vector<float> y((size_t) n * m, 0.0f);
     std::vector<llama_gemv_f32_args_t> args(ctx->nr_dpus);
 
-    ggml_downmem_stage_src1_vector(src1, x.data(), k);
+    ggml_downmem_stage_src1_matrix(src1, x.data(), k, m, k_pad);
 
     for (uint32_t d = 0; d < ctx->nr_dpus; ++d) {
         for (uint32_t row = 0; row < layout[d].rows; ++row) {
@@ -347,6 +363,7 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
             /* .k_pad    = */ k_pad,
             /* .n_rows   = */ layout[d].rows,
             /* .max_rows = */ max_rows,
+            /* .m        = */ m,
             /* .a_offset = */ 0,
             /* .x_offset = */ a_bytes,
             /* .y_offset = */ a_bytes + x_bytes,
@@ -393,7 +410,7 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
 
     idx = 0;
     DPU_FOREACH(ctx->set, each, idx) {
-        if (dpu_prepare_xfer(each, y_padded.data() + (size_t) idx * max_rows) != DPU_OK) {
+        if (dpu_prepare_xfer(each, y_padded.data() + (size_t) idx * y_floats_per_dpu) != DPU_OK) {
             GGML_LOG_ERROR("%s: dpu_prepare_xfer y failed\n", __func__);
             return false;
         }
@@ -406,22 +423,28 @@ static bool ggml_downmem_mul_mat_gemv(ggml_backend_downmem_context * ctx, ggml_t
 
     for (uint32_t d = 0; d < ctx->nr_dpus; ++d) {
         for (uint32_t row = 0; row < layout[d].rows; ++row) {
-            y[layout[d].row_offset + row] = y_padded[(size_t) d * max_rows + row];
+            const uint32_t global_row = layout[d].row_offset + row;
+            for (uint32_t out_col = 0; out_col < m; ++out_col) {
+                y[(size_t) out_col * n + global_row] =
+                    y_padded[(size_t) d * y_floats_per_dpu + (size_t) row * m + out_col];
+            }
         }
     }
 
-    if (!ggml_downmem_validate_result(src1, a_rows.data(), y.data(), k, n, k_pad)) {
+    if (!ggml_downmem_validate_result(x.data(), a_rows.data(), y.data(), k, n, m, k_pad)) {
         return false;
     }
 
-    for (uint32_t row = 0; row < n; ++row) {
-        float * dst_elem = (float *) ((char *) dst->data + row * dst->nb[0]);
-        *dst_elem = y[row];
+    for (uint32_t out_col = 0; out_col < m; ++out_col) {
+        for (uint32_t row = 0; row < n; ++row) {
+            float * dst_elem = (float *) ((char *) dst->data + row * dst->nb[0] + out_col * dst->nb[1]);
+            *dst_elem = y[(size_t) out_col * n + row];
+        }
     }
 
     ++ctx->executed_ops;
-    ggml_downmem_verbose_log("%s: executed op=%d k=%u n=%u dpus=%u max_rows=%u bytes=%" PRIu64 "\n",
-                             __func__, ctx->executed_ops, k, n, ctx->nr_dpus, max_rows, total_mram_bytes);
+    ggml_downmem_verbose_log("%s: executed op=%d k=%u n=%u m=%u dpus=%u max_rows=%u bytes=%" PRIu64 "\n",
+                             __func__, ctx->executed_ops, k, n, m, ctx->nr_dpus, max_rows, total_mram_bytes);
 
     return true;
 }
@@ -452,7 +475,7 @@ static enum ggml_status ggml_backend_downmem_graph_compute(ggml_backend_t backen
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:
-                if (!ggml_downmem_mul_mat_gemv(ctx, node)) {
+                if (!ggml_downmem_mul_mat_f32(ctx, node)) {
                     return GGML_STATUS_FAILED;
                 }
                 break;
@@ -557,23 +580,26 @@ static ggml_backend_buffer_type_t ggml_backend_downmem_device_get_buffer_type(gg
 
 static bool ggml_backend_downmem_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    return ggml_downmem_supports_mul_mat_gemv(op, false);
+    return ggml_downmem_supports_mul_mat_f32(op, false);
 }
 
 static bool ggml_backend_downmem_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-
-    static int claimed = 0;
-    const int max_ops = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_OPS", 1 << 30);
-    const bool supported = ggml_downmem_supports_mul_mat_gemv(op, true);
-
-    if (!supported || claimed >= max_ops) {
+    auto * ctx = (ggml_backend_downmem_device_context *) dev->context;
+    if (ctx == nullptr) {
         return false;
     }
 
-    ++claimed;
-    ggml_downmem_verbose_log("%s: claiming MUL_MAT k=%" PRId64 " n=%" PRId64 " claimed=%d max=%d\n",
-                             __func__, op->src[0]->ne[0], op->src[0]->ne[1], claimed, max_ops);
+    const int max_ops = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_OPS", 1 << 30);
+    const bool supported = ggml_downmem_supports_mul_mat_f32(op, true);
+
+    if (!supported || ctx->claimed_ops >= max_ops) {
+        return false;
+    }
+
+    ++ctx->claimed_ops;
+    ggml_downmem_verbose_log("%s: claiming MUL_MAT k=%" PRId64 " n=%" PRId64 " m=%" PRId64 " claimed=%d max=%d\n",
+                             __func__, op->src[0]->ne[0], op->src[0]->ne[1], op->src[1]->ne[1],
+                             ctx->claimed_ops, max_ops);
     return true;
 }
 
@@ -602,6 +628,7 @@ static const ggml_backend_device_i ggml_backend_downmem_device_i = {
 
 struct ggml_backend_downmem_reg_context {
     ggml_backend_device device;
+    ggml_backend_downmem_device_context device_ctx;
 };
 
 static const char * ggml_backend_downmem_reg_get_name(ggml_backend_reg_t reg) {
@@ -628,13 +655,7 @@ static const ggml_backend_reg_i ggml_backend_downmem_reg_i = {
 };
 
 ggml_backend_reg_t ggml_backend_downmem_reg(void) {
-    static ggml_backend_downmem_reg_context ctx = {
-        /* .device = */ {
-            /* .iface   = */ ggml_backend_downmem_device_i,
-            /* .reg     = */ nullptr,
-            /* .context = */ nullptr,
-        },
-    };
+    static ggml_backend_downmem_reg_context ctx = {};
 
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
@@ -642,6 +663,8 @@ ggml_backend_reg_t ggml_backend_downmem_reg(void) {
         /* .context     = */ &ctx,
     };
 
+    ctx.device.iface = ggml_backend_downmem_device_i;
     ctx.device.reg = &reg;
+    ctx.device.context = &ctx.device_ctx;
     return &reg;
 }

@@ -66,11 +66,13 @@ DMM_NR_SIM_THRDS="${DMM_NR_SIM_THRDS:-4}" \
 GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
+GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
 GGML_DOWNMEM_VALIDATE=1 \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/test-downmem-backend" 2>&1 | tee "${GGML_LOG}"
 grep -E "test-downmem-backend passed" "${GGML_LOG}" >/dev/null
 grep -E "executed op=1" "${GGML_LOG}" >/dev/null
+grep -E "executed op=.*m=" "${GGML_LOG}" >/dev/null
 
 COMMON_ARGS=(
   -m "${MODEL}"
@@ -95,6 +97,7 @@ GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
 GGML_DOWNMEM_MAX_OPS="${GGML_DOWNMEM_MAX_OPS:-1}" \
+GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
 GGML_DOWNMEM_ALLOW_QUANT_DEQUANT=1 \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/llama-completion" \
@@ -103,7 +106,7 @@ GGML_DOWNMEM_VERBOSE=1 \
 
 step "Verify downmem offload log"
 grep -E "claiming MUL_MAT|executed op=1" "${DOWNMEM_ERR}" >/dev/null
-grep -E "executed op=1" "${DOWNMEM_ERR}"
+grep -E "executed op=1.*m=" "${DOWNMEM_ERR}"
 
 step "Compare CPU and downmem generated stdout"
 if ! diff -u "${CPU_OUT}" "${DOWNMEM_OUT}" >"${DIFF_LOG}"; then
