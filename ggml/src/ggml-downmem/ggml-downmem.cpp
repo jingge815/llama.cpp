@@ -18,15 +18,25 @@ extern "C" {
 #include <string>
 #include <vector>
 
+enum {
+    LLAMA_DOWNMEM_OP_MUL_MAT_F32 = 0,
+    LLAMA_DOWNMEM_OP_SCALE_F32   = 1,
+};
+
 struct llama_gemv_f32_args_t {
+    uint32_t opcode;
     uint32_t k;
     uint32_t k_pad;
     uint32_t n_rows;
     uint32_t max_rows;
     uint32_t m;
+    uint32_t n_elems;
+    uint32_t max_elems;
     uint32_t a_offset;
     uint32_t x_offset;
     uint32_t y_offset;
+    float scale;
+    float bias;
 };
 
 struct dpu_rows_t {
@@ -45,6 +55,7 @@ struct ggml_backend_downmem_context {
 
 struct ggml_backend_downmem_device_context {
     int claimed_ops = 0;
+    int claimed_scale_ops = 0;
 };
 
 static bool ggml_downmem_env_enabled(void) {
@@ -96,6 +107,11 @@ static bool ggml_downmem_allow_quant_dequant(void) {
     return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
+static bool ggml_downmem_scale_enabled(void) {
+    const char * value = std::getenv("GGML_DOWNMEM_ENABLE_SCALE");
+    return value != nullptr && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+}
+
 static bool ggml_downmem_file_exists(const char * path) {
     if (path == nullptr) {
         return false;
@@ -116,6 +132,42 @@ static bool ggml_downmem_src1_is_plain_f32_matrix(const ggml_tensor * t) {
            t->nb[1] >= t->nb[0] * t->ne[0] &&
            t->ne[2] == 1 &&
            t->ne[3] == 1;
+}
+
+static bool ggml_downmem_is_linear_f32(const ggml_tensor * t) {
+    if (t == nullptr || t->type != GGML_TYPE_F32 || t->nb[0] != (int64_t) sizeof(float)) {
+        return false;
+    }
+
+    int64_t expected = (int64_t) sizeof(float);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] <= 1) {
+            continue;
+        }
+        expected *= t->ne[i - 1];
+        if (t->nb[i] != (size_t) expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_downmem_stage_linear_f32(const ggml_tensor * t, float * out, uint32_t n) {
+    if (!ggml_downmem_is_linear_f32(t) || ggml_nelements(t) != n) {
+        return false;
+    }
+
+    std::memcpy(out, t->data, (size_t) n * sizeof(float));
+    return true;
+}
+
+static bool ggml_downmem_write_linear_f32(ggml_tensor * t, const float * values, uint32_t n) {
+    if (!ggml_downmem_is_linear_f32(t) || ggml_nelements(t) != n) {
+        return false;
+    }
+
+    std::memcpy(t->data, values, (size_t) n * sizeof(float));
+    return true;
 }
 
 static bool ggml_downmem_src0_can_stage_to_f32(const ggml_tensor * t) {
@@ -168,6 +220,31 @@ static bool ggml_downmem_supports_mul_mat_f32(const ggml_tensor * op, bool requi
 
     const int max_cols = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_COLS", 128);
     if (max_cols > 0 && src1->ne[1] > max_cols) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_downmem_supports_scale_f32(const ggml_tensor * op, bool require_runtime_ready) {
+    if (!ggml_downmem_env_enabled() || !ggml_downmem_scale_enabled()) {
+        return false;
+    }
+    if (require_runtime_ready && !ggml_downmem_file_exists(ggml_downmem_dpu_bin())) {
+        return false;
+    }
+    if (op == nullptr || op->op != GGML_OP_SCALE || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = op->src[0];
+    if (!ggml_downmem_is_linear_f32(src0) || !ggml_downmem_is_linear_f32(op)) {
+        return false;
+    }
+    if (ggml_nelements(src0) != ggml_nelements(op)) {
+        return false;
+    }
+    if (ggml_nelements(op) <= 0 || ggml_nelements(op) > (int64_t) UINT32_MAX) {
         return false;
     }
 
@@ -295,6 +372,28 @@ static bool ggml_downmem_validate_result(const float * x, const float * a_rows, 
     return true;
 }
 
+static bool ggml_downmem_validate_scale_result(const float * x, const float * y,
+                                               uint32_t n, float scale, float bias) {
+    const char * enabled = std::getenv("GGML_DOWNMEM_VALIDATE");
+    if (enabled == nullptr || std::strcmp(enabled, "0") == 0) {
+        return true;
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        const float expected = x[i] * scale + bias;
+        const float got = y[i];
+        const float diff = std::fabs(got - expected);
+        const float rel = std::max(1.0f, std::fabs(expected));
+        if (!(diff <= 1.0e-4f || diff <= rel * 1.0e-4f)) {
+            GGML_LOG_ERROR("%s: validation failed i=%u expected=%g got=%g diff=%g\n",
+                           __func__, i, (double) expected, (double) got, (double) diff);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool ggml_downmem_mul_mat_f32(ggml_backend_downmem_context * ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -359,14 +458,19 @@ static bool ggml_downmem_mul_mat_f32(ggml_backend_downmem_context * ctx, ggml_te
         }
 
         args[d] = llama_gemv_f32_args_t {
+            /* .opcode   = */ LLAMA_DOWNMEM_OP_MUL_MAT_F32,
             /* .k        = */ k,
             /* .k_pad    = */ k_pad,
             /* .n_rows   = */ layout[d].rows,
             /* .max_rows = */ max_rows,
             /* .m        = */ m,
+            /* .n_elems  = */ 0,
+            /* .max_elems= */ 0,
             /* .a_offset = */ 0,
             /* .x_offset = */ a_bytes,
             /* .y_offset = */ a_bytes + x_bytes,
+            /* .scale    = */ 0.0f,
+            /* .bias     = */ 0.0f,
         };
     }
 
@@ -449,6 +553,143 @@ static bool ggml_downmem_mul_mat_f32(ggml_backend_downmem_context * ctx, ggml_te
     return true;
 }
 
+static bool ggml_downmem_scale_f32(ggml_backend_downmem_context * ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (!ggml_downmem_supports_scale_f32(dst, true)) {
+        GGML_LOG_ERROR("%s: scheduled unsupported op\n", __func__);
+        return false;
+    }
+    if (!ggml_downmem_load(ctx)) {
+        return false;
+    }
+
+    float params[2];
+    std::memcpy(params, dst->op_params, sizeof(params));
+    const float scale = params[0];
+    const float bias = params[1];
+
+    const uint32_t n = (uint32_t) ggml_nelements(dst);
+
+    std::vector<dpu_rows_t> layout(ctx->nr_dpus);
+    uint32_t max_elems = 0;
+    for (uint32_t d = 0; d < ctx->nr_dpus; ++d) {
+        const uint32_t base = n / ctx->nr_dpus;
+        const uint32_t rest = n % ctx->nr_dpus;
+        layout[d].rows = base + (d < rest ? 1u : 0u);
+        layout[d].row_offset = d * base + (d < rest ? d : rest);
+        max_elems = std::max(max_elems, layout[d].rows);
+    }
+    max_elems = std::max(max_elems, 1u);
+
+    const uint32_t x_bytes = max_elems * sizeof(float);
+    const uint32_t y_bytes = max_elems * sizeof(float);
+    const uint64_t total_mram_bytes = (uint64_t) x_bytes + y_bytes;
+    if (total_mram_bytes > 64ull * 1024ull * 1024ull) {
+        GGML_LOG_ERROR("%s: MRAM layout too large: %" PRIu64 " bytes\n", __func__, total_mram_bytes);
+        return false;
+    }
+
+    std::vector<float> x(n, 0.0f);
+    std::vector<float> x_padded((size_t) ctx->nr_dpus * max_elems, 0.0f);
+    std::vector<float> y_padded((size_t) ctx->nr_dpus * max_elems, 0.0f);
+    std::vector<float> y(n, 0.0f);
+    std::vector<llama_gemv_f32_args_t> args(ctx->nr_dpus);
+
+    if (!ggml_downmem_stage_linear_f32(src0, x.data(), n)) {
+        GGML_LOG_ERROR("%s: failed to stage src0\n", __func__);
+        return false;
+    }
+
+    for (uint32_t d = 0; d < ctx->nr_dpus; ++d) {
+        std::memcpy(x_padded.data() + (size_t) d * max_elems,
+                    x.data() + layout[d].row_offset,
+                    layout[d].rows * sizeof(float));
+
+        args[d] = llama_gemv_f32_args_t {
+            /* .opcode   = */ LLAMA_DOWNMEM_OP_SCALE_F32,
+            /* .k        = */ 0,
+            /* .k_pad    = */ 0,
+            /* .n_rows   = */ 0,
+            /* .max_rows = */ 0,
+            /* .m        = */ 0,
+            /* .n_elems  = */ layout[d].rows,
+            /* .max_elems= */ max_elems,
+            /* .a_offset = */ 0,
+            /* .x_offset = */ 0,
+            /* .y_offset = */ x_bytes,
+            /* .scale    = */ scale,
+            /* .bias     = */ bias,
+        };
+    }
+
+    dpu_set_t each;
+    uint32_t idx = 0;
+    DPU_FOREACH(ctx->set, each, idx) {
+        if (dpu_prepare_xfer(each, args.data() + idx) != DPU_OK) {
+            GGML_LOG_ERROR("%s: dpu_prepare_xfer args failed\n", __func__);
+            return false;
+        }
+    }
+    if (dpu_push_xfer(ctx->set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0,
+                      sizeof(llama_gemv_f32_args_t), DPU_XFER_DEFAULT) != DPU_OK) {
+        GGML_LOG_ERROR("%s: args transfer failed\n", __func__);
+        return false;
+    }
+
+    idx = 0;
+    DPU_FOREACH(ctx->set, each, idx) {
+        if (dpu_prepare_xfer(each, x_padded.data() + (size_t) idx * max_elems) != DPU_OK) {
+            GGML_LOG_ERROR("%s: dpu_prepare_xfer x failed\n", __func__);
+            return false;
+        }
+    }
+    if (dpu_push_xfer(ctx->set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0,
+                      x_bytes, DPU_XFER_DEFAULT) != DPU_OK) {
+        GGML_LOG_ERROR("%s: x transfer failed\n", __func__);
+        return false;
+    }
+
+    if (dpu_launch(ctx->set, DPU_SYNCHRONOUS) != DPU_OK) {
+        GGML_LOG_ERROR("%s: dpu_launch failed\n", __func__);
+        return false;
+    }
+
+    idx = 0;
+    DPU_FOREACH(ctx->set, each, idx) {
+        if (dpu_prepare_xfer(each, y_padded.data() + (size_t) idx * max_elems) != DPU_OK) {
+            GGML_LOG_ERROR("%s: dpu_prepare_xfer y failed\n", __func__);
+            return false;
+        }
+    }
+    if (dpu_push_xfer(ctx->set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME, x_bytes,
+                      y_bytes, DPU_XFER_DEFAULT) != DPU_OK) {
+        GGML_LOG_ERROR("%s: y transfer failed\n", __func__);
+        return false;
+    }
+
+    for (uint32_t d = 0; d < ctx->nr_dpus; ++d) {
+        std::memcpy(y.data() + layout[d].row_offset,
+                    y_padded.data() + (size_t) d * max_elems,
+                    layout[d].rows * sizeof(float));
+    }
+
+    if (!ggml_downmem_validate_scale_result(x.data(), y.data(), n, scale, bias)) {
+        return false;
+    }
+
+    if (!ggml_downmem_write_linear_f32(dst, y.data(), n)) {
+        GGML_LOG_ERROR("%s: failed to write dst\n", __func__);
+        return false;
+    }
+
+    ++ctx->executed_ops;
+    ggml_downmem_verbose_log("%s: executed op=%d kind=SCALE n=%u dpus=%u max_elems=%u bytes=%" PRIu64 "\n",
+                             __func__, ctx->executed_ops, n, ctx->nr_dpus, max_elems, total_mram_bytes);
+
+    return true;
+}
+
 static const char * ggml_backend_downmem_get_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
     return "Downmem";
@@ -476,6 +717,12 @@ static enum ggml_status ggml_backend_downmem_graph_compute(ggml_backend_t backen
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 if (!ggml_downmem_mul_mat_f32(ctx, node)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+
+            case GGML_OP_SCALE:
+                if (!ggml_downmem_scale_f32(ctx, node)) {
                     return GGML_STATUS_FAILED;
                 }
                 break;
@@ -580,7 +827,8 @@ static ggml_backend_buffer_type_t ggml_backend_downmem_device_get_buffer_type(gg
 
 static bool ggml_backend_downmem_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    return ggml_downmem_supports_mul_mat_f32(op, false);
+    return ggml_downmem_supports_mul_mat_f32(op, false) ||
+           ggml_downmem_supports_scale_f32(op, false);
 }
 
 static bool ggml_backend_downmem_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -590,17 +838,31 @@ static bool ggml_backend_downmem_device_offload_op(ggml_backend_dev_t dev, const
     }
 
     const int max_ops = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_OPS", 1 << 30);
-    const bool supported = ggml_downmem_supports_mul_mat_f32(op, true);
+    if (ggml_downmem_supports_mul_mat_f32(op, true)) {
+        if (ctx->claimed_ops >= max_ops) {
+            return false;
+        }
 
-    if (!supported || ctx->claimed_ops >= max_ops) {
-        return false;
+        ++ctx->claimed_ops;
+        ggml_downmem_verbose_log("%s: claiming MUL_MAT k=%" PRId64 " n=%" PRId64 " m=%" PRId64 " claimed=%d max=%d\n",
+                                 __func__, op->src[0]->ne[0], op->src[0]->ne[1], op->src[1]->ne[1],
+                                 ctx->claimed_ops, max_ops);
+        return true;
     }
 
-    ++ctx->claimed_ops;
-    ggml_downmem_verbose_log("%s: claiming MUL_MAT k=%" PRId64 " n=%" PRId64 " m=%" PRId64 " claimed=%d max=%d\n",
-                             __func__, op->src[0]->ne[0], op->src[0]->ne[1], op->src[1]->ne[1],
-                             ctx->claimed_ops, max_ops);
-    return true;
+    const int max_scale_ops = ggml_downmem_env_i32("GGML_DOWNMEM_MAX_SCALE_OPS", 1);
+    if (ggml_downmem_supports_scale_f32(op, true)) {
+        if (ctx->claimed_scale_ops >= max_scale_ops) {
+            return false;
+        }
+
+        ++ctx->claimed_scale_ops;
+        ggml_downmem_verbose_log("%s: claiming SCALE n=%" PRId64 " claimed=%d max=%d\n",
+                                 __func__, ggml_nelements(op), ctx->claimed_scale_ops, max_scale_ops);
+        return true;
+    }
+
+    return false;
 }
 
 static bool ggml_backend_downmem_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

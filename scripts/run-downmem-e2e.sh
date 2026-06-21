@@ -45,7 +45,7 @@ if [[ ! -x "${DPU_BIN}" ]]; then
   exit 1
 fi
 
-step "Run standalone downmem GEMV test"
+step "Run standalone downmem GEMV/SCALE test"
 DMM_NR_SIM_THRDS="${DMM_NR_SIM_THRDS:-4}" \
   "${DOWNMEM_BUILD}/dmmLLAMA_GEMV_F32" "${DPU_BIN}" 2>&1 | tee "${GEMV_LOG}"
 grep -E "LLAMA_GEMV_F32 passed" "${GEMV_LOG}" >/dev/null
@@ -67,12 +67,14 @@ GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
 GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
+GGML_DOWNMEM_ENABLE_SCALE="${GGML_DOWNMEM_ENABLE_SCALE:-1}" \
 GGML_DOWNMEM_VALIDATE=1 \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/test-downmem-backend" 2>&1 | tee "${GGML_LOG}"
 grep -E "test-downmem-backend passed" "${GGML_LOG}" >/dev/null
 grep -E "executed op=1" "${GGML_LOG}" >/dev/null
 grep -E "executed op=.*m=" "${GGML_LOG}" >/dev/null
+grep -E "kind=SCALE" "${GGML_LOG}" >/dev/null
 
 COMMON_ARGS=(
   -m "${MODEL}"
@@ -80,7 +82,8 @@ COMMON_ARGS=(
   -n "${N_PREDICT}"
   -t 1 -tb 1
   -s 42
-  --temp 0 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1
+  --temp 0.8 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1
+  --backend-sampling
   --no-display-prompt
   --no-warmup
   --no-context-shift
@@ -97,8 +100,10 @@ GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
 GGML_DOWNMEM_MAX_OPS="${GGML_DOWNMEM_MAX_OPS:-1}" \
+GGML_DOWNMEM_MAX_SCALE_OPS="${GGML_DOWNMEM_MAX_SCALE_OPS:-2}" \
 GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
 GGML_DOWNMEM_ALLOW_QUANT_DEQUANT=1 \
+GGML_DOWNMEM_ENABLE_SCALE="${GGML_DOWNMEM_ENABLE_SCALE:-1}" \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/llama-completion" \
   "${COMMON_ARGS[@]}" \
@@ -107,6 +112,7 @@ GGML_DOWNMEM_VERBOSE=1 \
 step "Verify downmem offload log"
 grep -E "claiming MUL_MAT|executed op=1" "${DOWNMEM_ERR}" >/dev/null
 grep -E "executed op=1.*m=" "${DOWNMEM_ERR}"
+grep -E "kind=SCALE" "${DOWNMEM_ERR}"
 
 step "Compare CPU and downmem generated stdout"
 if ! diff -u "${CPU_OUT}" "${DOWNMEM_OUT}" >"${DIFF_LOG}"; then

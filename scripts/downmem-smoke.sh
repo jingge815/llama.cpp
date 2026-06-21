@@ -38,6 +38,7 @@ GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
 GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
+GGML_DOWNMEM_ENABLE_SCALE="${GGML_DOWNMEM_ENABLE_SCALE:-1}" \
 GGML_DOWNMEM_VALIDATE=1 \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/test-downmem-backend" 2>&1 | tee "${TEST_LOG}"
@@ -45,14 +46,17 @@ GGML_DOWNMEM_VERBOSE=1 \
 grep -E "test-downmem-backend passed" "${TEST_LOG}" >/dev/null
 grep -E "executed op=1" "${TEST_LOG}" >/dev/null
 grep -E "executed op=.*m=" "${TEST_LOG}" >/dev/null
+grep -E "kind=SCALE" "${TEST_LOG}" >/dev/null
 
 DMM_NR_SIM_THRDS="${DMM_NR_SIM_THRDS:-4}" \
 GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN="${DPU_BIN}" \
 GGML_DOWNMEM_NR_DPUS="${GGML_DOWNMEM_NR_DPUS:-4}" \
 GGML_DOWNMEM_MAX_OPS="${GGML_DOWNMEM_MAX_OPS:-1}" \
+GGML_DOWNMEM_MAX_SCALE_OPS="${GGML_DOWNMEM_MAX_SCALE_OPS:-2}" \
 GGML_DOWNMEM_MAX_COLS="${GGML_DOWNMEM_MAX_COLS:-128}" \
 GGML_DOWNMEM_ALLOW_QUANT_DEQUANT=1 \
+GGML_DOWNMEM_ENABLE_SCALE="${GGML_DOWNMEM_ENABLE_SCALE:-1}" \
 GGML_DOWNMEM_VERBOSE=1 \
 "${LLAMA_BUILD}/bin/llama-completion" \
   -m "${MODEL}" \
@@ -60,7 +64,8 @@ GGML_DOWNMEM_VERBOSE=1 \
   -n "${N_PREDICT:-1}" \
   -t 1 -tb 1 \
   -s 42 \
-  --temp 0 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1 \
+  --temp 0.8 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1 \
+  --backend-sampling \
   --no-display-prompt \
   --no-warmup \
   --no-context-shift \
@@ -70,3 +75,4 @@ GGML_DOWNMEM_VERBOSE=1 \
 
 grep -E "claiming MUL_MAT|executed op=1" "${LLAMA_LOG}" >/dev/null
 grep -E "executed op=1.*m=" "${LLAMA_LOG}" >/dev/null
+grep -E "kind=SCALE" "${LLAMA_LOG}" >/dev/null

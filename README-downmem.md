@@ -3,8 +3,9 @@
 ## 仓库用途
 
 这个 fork 主要用于在 `llama.cpp` 中开发和验证 Downmem 适配. 当前重点是把
-ggml 中窄范围 F32 `GGML_OP_MUL_MAT` offload 到 Downmem RV simulator, 用于
-验证 Downmem runtime, DPU binary 和 llama.cpp 后端调度之间的端到端链路.
+ggml 中窄范围 F32 `GGML_OP_MUL_MAT` 和 opt-in `GGML_OP_SCALE` offload 到
+Downmem RV simulator, 用于验证 Downmem runtime, DPU binary 和 llama.cpp
+后端调度之间的端到端链路.
 
 上游仓库仍然是:
 
@@ -32,6 +33,7 @@ feature/llama-downmem-offload
 - 注册 `Downmem` ggml backend device, 可通过 `--device Downmem` 选择.
 - 支持窄范围 F32 `GGML_OP_MUL_MAT`, 包括单列 GEMV 和少量 RHS 列的 batched
   MUL_MAT.
+- 支持 opt-in 窄范围 F32 `GGML_OP_SCALE`, 用于验证多算子 Downmem 链路.
 - 支持 F32 矩阵输入; 量化矩阵可在 host 端 dequant 到 F32 后 offload.
 - 支持通过环境变量控制 DPU binary, DPU 数量, 最大 offload op 数量和校验模式.
 - 新增 `test-downmem-backend` 正确性测试.
@@ -39,8 +41,8 @@ feature/llama-downmem-offload
 - 新增 `scripts/run-downmem-e2e.sh` 一键端到端验证脚本.
 - 新增中文技术文档: `docs/backend/DOWNMEM.md`.
 
-当前实现不是完整通用加速后端. 它只覆盖矩阵乘中的窄范围 F32 路径, 主要用于
-Downmem 适配验证和迭代.
+当前实现不是完整通用加速后端. 它只覆盖矩阵乘和 SCALE 中的窄范围 F32
+路径, 主要用于 Downmem 适配验证和迭代.
 
 ## 使用方法
 
@@ -96,8 +98,9 @@ scripts/run-downmem-e2e.sh
 - 构建 Downmem runtime 和 `LLAMA_GEMV_F32` DPU binary.
 - 配置并构建 llama.cpp Downmem 后端.
 - 运行 standalone Downmem `LLAMA_GEMV_F32` 测试.
-- 运行 ggml 层 `test-downmem-backend`.
-- 分别运行 CPU 和 Downmem completion.
+- 运行 ggml 层 `test-downmem-backend`, 覆盖 MUL_MAT 和 SCALE.
+- 分别运行 CPU 和 Downmem completion, 并要求 Downmem completion 日志同时出现
+  MUL_MAT 和 SCALE.
 - 比较 CPU 与 Downmem 的 stdout.
 
 默认日志目录:
@@ -114,7 +117,9 @@ GGML_DOWNMEM=1 \
 GGML_DOWNMEM_DPU_BIN=/home/fjg/src/downmem/build-rv/devApp/rvbins/LLAMA_GEMV_F32 \
 GGML_DOWNMEM_NR_DPUS=4 \
 GGML_DOWNMEM_MAX_OPS=1 \
+GGML_DOWNMEM_MAX_SCALE_OPS=2 \
 GGML_DOWNMEM_MAX_COLS=128 \
+GGML_DOWNMEM_ENABLE_SCALE=1 \
 GGML_DOWNMEM_ALLOW_QUANT_DEQUANT=1 \
 GGML_DOWNMEM_VERBOSE=1 \
 build-downmem/bin/llama-completion \
@@ -123,7 +128,8 @@ build-downmem/bin/llama-completion \
   -n 1 \
   -t 1 -tb 1 \
   -s 42 \
-  --temp 0 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1 \
+  --temp 0.8 --top-k 1 --top-p 1 --min-p 0 --repeat-penalty 1 \
+  --backend-sampling \
   --no-display-prompt \
   --no-warmup \
   --no-context-shift \
@@ -137,6 +143,7 @@ build-downmem/bin/llama-completion \
 ```text
 claiming MUL_MAT
 executed op=1 ... m=1
+kind=SCALE
 ```
 
 更多技术细节见:

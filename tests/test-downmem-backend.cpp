@@ -18,6 +18,11 @@ static float pattern_x(int out_col, int col) {
     return (float) v * 0.0625f;
 }
 
+static float pattern_scale(int i) {
+    const int v = (i * 37 + 11) % 41 - 20;
+    return (float) v * 0.03125f;
+}
+
 static void fill_tensor_2d_f32(ggml_tensor * t, int rows, int cols) {
     for (int row = 0; row < rows; ++row) {
         float * dst = (float *) ((char *) t->data + row * t->nb[1]);
@@ -72,6 +77,39 @@ static std::vector<float> run_graph(ggml_backend_t backend, int n, int k, int m)
     return result;
 }
 
+static std::vector<float> run_scale_graph(ggml_backend_t backend, int n, float scale, float bias) {
+    const size_t mem_size = 16u * 1024u * 1024u;
+    ggml_init_params params = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    for (int i = 0; i < n; ++i) {
+        ((float *) x->data)[i] = pattern_scale(i);
+    }
+
+    ggml_tensor * y = ggml_scale_bias(ctx, x, scale, bias);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "scale graph compute failed: %d\n", (int) status);
+        std::exit(1);
+    }
+
+    std::vector<float> result(n);
+    for (int i = 0; i < n; ++i) {
+        result[i] = ((float *) y->data)[i];
+    }
+
+    ggml_free(ctx);
+    return result;
+}
+
 static bool compare_case(const std::vector<float> & got, const std::vector<float> & expected,
                          int n, int m) {
     for (int out_col = 0; out_col < m; ++out_col) {
@@ -109,6 +147,18 @@ int main(void) {
         { 33, 64, 5 },
     };
 
+    struct scale_case {
+        int n;
+        float scale;
+        float bias;
+    };
+
+    const scale_case scale_cases[] = {
+        { 17, 1.25f, -0.5f },
+        { 64, -0.75f, 0.125f },
+        { 3, 0.5f, 2.0f },
+    };
+
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (cpu == nullptr) {
         fprintf(stderr, "failed to init CPU backend\n");
@@ -133,6 +183,16 @@ int main(void) {
         std::vector<float> expected = run_graph(cpu, tc.n, tc.k, tc.m);
         std::vector<float> got = run_graph(downmem, tc.n, tc.k, tc.m);
         if (!compare_case(got, expected, tc.n, tc.m)) {
+            ggml_backend_free(downmem);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+    }
+
+    for (const scale_case & tc : scale_cases) {
+        std::vector<float> expected = run_scale_graph(cpu, tc.n, tc.scale, tc.bias);
+        std::vector<float> got = run_scale_graph(downmem, tc.n, tc.scale, tc.bias);
+        if (!compare_case(got, expected, tc.n, 1)) {
             ggml_backend_free(downmem);
             ggml_backend_free(cpu);
             return 1;
